@@ -82,8 +82,6 @@ async function calculateRoute(start, end) {
   }).addTo(map);
 
   map.fitBounds(routeLayer.getBounds());
-
-  sendToPi(data.commands);
 }
 
 // ================= SEND TO PI =================
