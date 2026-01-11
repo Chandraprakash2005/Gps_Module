@@ -215,6 +215,7 @@ function generateMovementCommands(coords) {
   const commands = [];
   let currentSegmentBearing = null;
   let accumulatedDistance = 0;
+  let isMovingBackward = false;
 
   // Helper to format absolute bearing as tr/tl
   function formatAbsoluteTurn(bearing) {
@@ -226,41 +227,52 @@ function generateMovementCommands(coords) {
     }
   }
 
+  // Helper to push accumulated movement
+  function flushMovement() {
+    if (accumulatedDistance > 0.5) {
+      const type = isMovingBackward ? "mb" : "mf";
+      commands.push(`${type}${accumulatedDistance.toFixed(1)}`);
+      accumulatedDistance = 0;
+    }
+  }
+
   for (let i = 0; i < coords.length - 1; i++) {
     const p1 = coords[i];     // [lng, lat]
     const p2 = coords[i + 1]; // [lng, lat]
 
     const dist = getDistance(p1[1], p1[0], p2[1], p2[0]);
-    const bearing = getBearing(p1[1], p1[0], p2[1], p2[0]);
+    let bearing = getBearing(p1[1], p1[0], p2[1], p2[0]);
 
-    // Initial direction or significant turn
     if (currentSegmentBearing === null) {
       commands.push(formatAbsoluteTurn(bearing));
       currentSegmentBearing = bearing;
     } else {
+      // Calculate diff relative to our face (currentSegmentBearing)
       let diff = bearing - currentSegmentBearing;
       if (diff > 180) diff -= 360;
       if (diff < -180) diff += 360;
 
-      // If bearing changes significantly, update it
-      if (Math.abs(diff) > 5) {
-        commands.push(formatAbsoluteTurn(bearing));
-        currentSegmentBearing = bearing;
-        // Optional: Reset accumulatedDistance on a turn if desired, 
-        // though "mf" every 10m usually continues relative to start/last turn.
-        // accumulatedDistance = 0; 
+      // Check if we should switch to mf/mb or turn
+      if (Math.abs(diff) > 10) {
+        // If the waypoint is behind us (~180 deg diff)
+        if (Math.abs(diff) > 165 && Math.abs(diff) < 195) {
+          flushMovement();
+          isMovingBackward = !isMovingBackward;
+          // Note: currentSegmentBearing doesn't change, we just flip direction
+        } else {
+          // Significant turn required
+          flushMovement();
+          isMovingBackward = false;
+          commands.push(formatAbsoluteTurn(bearing));
+          currentSegmentBearing = bearing;
+        }
       }
     }
     
     accumulatedDistance += dist;
-
-    // Record "mf" for every 10 meters
-    while (accumulatedDistance >= 10) {
-      commands.push("mf");
-      accumulatedDistance -= 10;
-    }
   }
 
+  flushMovement();
   return commands;
 }
   </script>
