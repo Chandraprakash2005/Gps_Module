@@ -37,245 +37,150 @@
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 
 <script>
-/* ================= MAP ================= */
+let currentPosition = null;
+let sourceMarker = null;
+let destMarker = null;
+let routeLayer = null;
+
 const map = L.map("map").setView([12.7517, 80.1993], 16);
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: "© OpenStreetMap"
 }).addTo(map);
 
-/* ================= DYNAMIC PC SOURCE (GPS) ================= */
-let PC_SOURCE = [80.19539, 12.75164]; // Default fallback
-let sourceMarker = null;
+// ========== LIVE GPS ==========
+navigator.geolocation.watchPosition(
+  (pos) => {
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    currentPosition = [lng, lat];
 
-// Get user's actual GPS location
-if (navigator.geolocation) {
-  navigator.geolocation.watchPosition(
-    (position) => {
-      const lng = position.coords.longitude;
-      const lat = position.coords.latitude;
-      
-      PC_SOURCE = [lng, lat]; // Update source to actual GPS
-      
-      // Update marker
-      if (sourceMarker) map.removeLayer(sourceMarker);
-      
-      sourceMarker = L.marker([lat, lng])
-        .addTo(map)
-        .bindPopup("📍 Your Location (Source)")
-        .openPopup();
-      
-      console.log("📍 PC Location updated:", PC_SOURCE);
-    },
-    (error) => {
-      console.warn("GPS unavailable, using default location:", error);
-      // Show default marker
-      sourceMarker = L.marker([PC_SOURCE[1], PC_SOURCE[0]])
-        .addTo(map)
-        .bindPopup("🖥️ Default Location (Source)");
-    },
-    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
-  );
-} else {
-  // GPS not supported, use default
-  sourceMarker = L.marker([PC_SOURCE[1], PC_SOURCE[0]])
-    .addTo(map)
-    .bindPopup("🖥️ Default Location (Source)");
-}
+    if (sourceMarker) map.removeLayer(sourceMarker);
+    sourceMarker = L.marker([lat, lng])
+      .addTo(map)
+      .bindPopup("You are here")
+      .openPopup();
+  },
+  () => alert("GPS error"),
+  { enableHighAccuracy:true }
+);
 
-/* ================= CLICKED DESTINATION ================= */
-let destination = null;
-let destMarker = null;
-let routeLayer = null;
+// ========== SEND GPS TO PC ==========
+setInterval(() => {
+  if (currentPosition) {
+    fetch("/gps", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ pos: currentPosition })
+    });
+  }
+}, 1000);
 
-/* ================= MAP CLICK HANDLER ================= */
-map.on("click", function (e) {
-  const lat = e.latlng.lat;
-  const lng = e.latlng.lng;
+// ========== MAP CLICK ==========
+map.on("click", (e) => {
+  if (!currentPosition) {
+    alert("Waiting for GPS...");
+    return;
+  }
 
-  destination = [lng, lat]; // [lng, lat]
+  const dest = [e.latlng.lng, e.latlng.lat];
 
   if (destMarker) map.removeLayer(destMarker);
-
-  destMarker = L.marker([lat, lng])
+  destMarker = L.marker([dest[1], dest[0]])
     .addTo(map)
-    .bindPopup("🎯 Selected Destination")
+    .bindPopup("Destination")
     .openPopup();
 
-  // Auto-calculate route
-  calculateRoute();
+  calculateRoute(currentPosition, dest);
 });
 
-/* ================= ROUTING ================= */
-async function calculateRoute() {
-
-  if (!destination) {
-    alert("Click on the map to select a destination");
-    return;
-  }
-
-  const response = await fetch("/route", {
+// ========== REQUEST ROUTE FROM PC ==========
+async function calculateRoute(start, end) {
+  const res = await fetch("/route", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      coordinates: [PC_SOURCE, destination]
-    })
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ coordinates:[start,end] })
   });
 
-  const data = await response.json();
+  const data = await res.json();
 
-  if (!data.features) {
-    console.error("Routing error:", data);
-    alert("Route not found. Try clicking nearer to a path.");
-    return;
-  }
+  console.log("Commands:", data.commands);
+  console.log("Distance:", data.distance);
+  console.log("Duration:", data.duration);
 
-  const coords = data.features[0].geometry.coordinates;
-  const latLngs = coords.map(c => [c[1], c[0]]);
-
-  // Display coordinates in console
-  console.log("=== ROUTE COORDINATES ===");
-  console.log("Total waypoints:", coords.length);
-  console.log("All coordinates [lng, lat]:", coords);
-  console.log("Distance:", data.features[0].properties.distance, "meters");
-  console.log("Duration:", data.features[0].properties.duration, "seconds");
-
-  // Process route to generate commands
-  const commands = generateMovementCommands(coords);
-  console.log("=== MOVEMENT COMMANDS ===");
-  console.log(commands);
-
-  // Send to Raspberry Pi
-  sendToPi(coords, data.features[0].properties.distance, data.features[0].properties.duration, commands);
-
-  if (routeLayer) map.removeLayer(routeLayer);
-
-  routeLayer = L.polyline(latLngs, {
-    color: "blue",
-    weight: 6
-  }).addTo(map);
-
-  map.fitBounds(routeLayer.getBounds());
+  sendToPi(data.commands);
 }
 
-/* ================= SEND TO RASPBERRY PI ================= */
-async function sendToPi(routeCoords, distance, duration, commands) {
+// ========== SEND TO PI ==========
+async function sendToPi(commands) {
   try {
-    const response = await fetch("http://10.177.21.229:5000/route", {
+    const res = await fetch("http://10.177.21.229:5000/route", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        coordinates: routeCoords,   // [[lng,lat], [lng,lat], ...]
-        distance: distance,
-        duration: duration,
-        commands: commands          // ["mf", "tf30", "mf", ...]
-      })
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ commands })
     });
 
-    const data = await response.json();
-    console.log("✅ Sent to Pi:", data);
-
-  } catch (err) {
-    console.error("❌ Failed to send to Pi:", err);
+    const data = await res.json();
+    console.log("Pi:", data);
+  } catch(e) {
+    console.error("Pi error", e);
   }
 }
 
-/* ================= MOVEMENT LOGIC ================= */
+let robotMarker = null;
+let targetMarker = null;
 
-// Calculate distance between two points in meters (Haversine)
-function getDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371e3; // Earth Radius in meters
-  const φ1 = lat1 * Math.PI / 180;
-  const φ2 = lat2 * Math.PI / 180;
-  const Δφ = (lat2 - lat1) * Math.PI / 180;
-  const Δλ = (lon2 - lon1) * Math.PI / 180;
+setInterval(async () => {
+    try {
+        const res = await fetch("/gps/live");
+        const data = await res.json();
 
-  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-            Math.cos(φ1) * Math.cos(φ2) *
-            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        if (!data.pos) return;
 
-  return R * c;
-}
+        const lat = data.pos[1];
+        const lng = data.pos[0];
 
-// Calculate bearing between two points in degrees
-function getBearing(lat1, lon1, lat2, lon2) {
-  const y = Math.sin((lon2 - lon1) * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180);
-  const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) -
-            Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos((lon2 - lon1) * Math.PI / 180);
-  let brng = Math.atan2(y, x) * 180 / Math.PI;
-  return (brng + 360) % 360;
-}
-
-function generateMovementCommands(coords) {
-  if (coords.length < 2) return [];
-
-  const commands = [];
-  let currentSegmentBearing = null;
-  let accumulatedDistance = 0;
-  let isMovingBackward = false;
-
-  // Helper to format absolute bearing as tr/tl
-  function formatAbsoluteTurn(bearing) {
-    bearing = (bearing + 360) % 360; 
-    if (bearing <= 180) {
-      return `tr${Math.round(bearing)}`;
-    } else {
-      return `tl${Math.round(360 - bearing)}`;
-    }
-  }
-
-  // Helper to push accumulated movement
-  function flushMovement() {
-    if (accumulatedDistance > 0.5) {
-      const type = isMovingBackward ? "mb" : "mf";
-      commands.push(`${type}${accumulatedDistance.toFixed(1)}`);
-      accumulatedDistance = 0;
-    }
-  }
-
-  for (let i = 0; i < coords.length - 1; i++) {
-    const p1 = coords[i];     // [lng, lat]
-    const p2 = coords[i + 1]; // [lng, lat]
-
-    const dist = getDistance(p1[1], p1[0], p2[1], p2[0]);
-    let bearing = getBearing(p1[1], p1[0], p2[1], p2[0]);
-
-    if (currentSegmentBearing === null) {
-      commands.push(formatAbsoluteTurn(bearing));
-      currentSegmentBearing = bearing;
-    } else {
-      // Calculate diff relative to our face (currentSegmentBearing)
-      let diff = bearing - currentSegmentBearing;
-      if (diff > 180) diff -= 360;
-      if (diff < -180) diff += 360;
-
-      // Check if we should switch to mf/mb or turn
-      if (Math.abs(diff) > 10) {
-        // If the waypoint is behind us (~180 deg diff)
-        if (Math.abs(diff) > 165 && Math.abs(diff) < 195) {
-          flushMovement();
-          isMovingBackward = !isMovingBackward;
-          // Note: currentSegmentBearing doesn't change, we just flip direction
+        if (!robotMarker) {
+            robotMarker = L.marker([lat, lng], {
+                icon: L.icon({
+                    iconUrl: "https://cdn-icons-png.flaticon.com/512/854/854878.png",
+                    iconSize: [40,40]
+                })
+            }).addTo(map).bindPopup("🤖 Robot");
         } else {
-          // Significant turn required
-          flushMovement();
-          isMovingBackward = false;
-          commands.push(formatAbsoluteTurn(bearing));
-          currentSegmentBearing = bearing;
+            robotMarker.setLatLng([lat,lng]);
         }
-      }
-    }
-    
-    accumulatedDistance += dist;
-  }
 
-  flushMovement();
-  return commands;
+        // Show target waypoint
+        if (data.target) {
+            const tlat = data.target[1];
+            const tlng = data.target[0];
+
+            if (!targetMarker) {
+                targetMarker = L.circleMarker([tlat,tlng], {
+                    radius: 10,
+                    color: "red"
+                }).addTo(map);
+            } else {
+                targetMarker.setLatLng([tlat,tlng]);
+            }
+        }
+
+    } catch(e){}
+}, 1000);
+
+let driftLine = null;
+
+function drawDrift(robot, target){
+    if (driftLine) map.removeLayer(driftLine);
+
+    driftLine = L.polyline([
+        [robot[1],robot[0]],
+        [target[1],target[0]]
+    ], {color:"red", dashArray:"5,5"}).addTo(map);
 }
-  </script>
+
+</script>
 
 </body>
 </html>
