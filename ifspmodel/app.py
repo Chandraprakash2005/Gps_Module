@@ -5,18 +5,20 @@ import requests, math, threading, time
 app = Flask(__name__)
 CORS(app)
 
+# ================= CONFIG =================
 MAPBOX_TOKEN = "pk.eyJ1IjoibWF5dXJrcyIsImEiOiJjbWpoZmF5cTQwcTZzM2RxdmZkeGc4aXRvIn0.w53nwvcH9lLU_bx9aoiVZw"
+PI_URL = "http://10.177.21.229:5000/route"
 
 # ================= STATE =================
 current_gps = None
 gps_buffer = []
-active_waypoints = []
+route_geometry = []      # full polyline
+active_waypoints = []   # sliced
 current_index = 0
 current_destination = None
 last_reroute = 0
-obstacle_detected = False
 
-# ================= MATH =================
+# ================= GEO =================
 
 def haversine(a, b):
     R = 6371000
@@ -35,28 +37,29 @@ def bearing(a, b):
     y = math.cos(lat1)*math.sin(lat2) - math.sin(lat1)*math.cos(lat2)*math.cos(dlon)
     return (math.degrees(math.atan2(x,y)) + 360) % 360
 
-# ================= ROUTE SLICING =================
+# ================= SNAP =================
+
+def nearest_point_on_route(pos, geometry):
+    best = geometry[0]
+    best_dist = 1e9
+    for p in geometry:
+        d = haversine(pos, p)
+        if d < best_dist:
+            best_dist = d
+            best = p
+    return best, best_dist
+
+# ================= SLICE =================
 
 def slice_route(coords, step=12):
     sliced = [coords[0]]
-    dist = 0
-    last_bearing = None
-
+    acc = 0
     for i in range(len(coords)-1):
         d = haversine(coords[i], coords[i+1])
-        b = bearing(coords[i], coords[i+1])
-
-        if last_bearing is None:
-            last_bearing = b
-
-        turn = abs(b - last_bearing)
-        dist += d
-
-        if dist >= step or turn > 25:
+        acc += d
+        if acc >= step:
             sliced.append(coords[i+1])
-            dist = 0
-            last_bearing = b
-
+            acc = 0
     sliced.append(coords[-1])
     return sliced
 
@@ -65,23 +68,18 @@ def slice_route(coords, step=12):
 def generate_commands(points):
     cmds = []
     for i in range(len(points)-1):
-        b1 = bearing(points[i], points[i+1])
         dist = haversine(points[i], points[i+1])
-
         if i > 0:
             b0 = bearing(points[i-1], points[i])
-            delta = (b1 - b0 + 540) % 360 - 180
-
-            if abs(delta) > 15:
-                if delta > 0:
-                    cmds.append(f"tr{int(abs(delta))}")
-                else:
-                    cmds.append(f"tl{int(abs(delta))}")
-
+            b1 = bearing(points[i], points[i+1])
+            d = (b1 - b0 + 540) % 360 - 180
+            if abs(d) > 10:
+                if d > 0: cmds.append(f"tr{int(abs(d))}")
+                else: cmds.append(f"tl{int(abs(d))}")
         cmds.append(f"mf{round(dist,1)}")
     return cmds
 
-# ================= FRONTEND =================
+# ================= UI =================
 
 @app.route("/")
 def home():
@@ -92,16 +90,12 @@ def home():
 @app.route("/gps", methods=["POST"])
 def gps():
     global current_gps, gps_buffer
-
     pos = request.json["pos"]
     gps_buffer.append(pos)
-
     if len(gps_buffer) > 5:
         gps_buffer.pop(0)
-
-    lng = sum(p[0] for p in gps_buffer) / len(gps_buffer)
-    lat = sum(p[1] for p in gps_buffer) / len(gps_buffer)
-
+    lng = sum(p[0] for p in gps_buffer)/len(gps_buffer)
+    lat = sum(p[1] for p in gps_buffer)/len(gps_buffer)
     current_gps = [lng, lat]
     return "ok"
 
@@ -109,97 +103,96 @@ def gps():
 
 @app.route("/route", methods=["POST"])
 def route():
-    global active_waypoints, current_index, current_destination
+    global route_geometry, active_waypoints, current_index, current_destination
+
+    data = request.get_json()
+    _, end = data["coordinates"]
+    current_destination = end
 
     if not current_gps:
         return jsonify({"error":"GPS not ready"}), 400
 
-    data = request.get_json()
-    _, end = data["coordinates"]
-
-    current_destination = end
     start = current_gps
 
     url = f"https://api.mapbox.com/directions/v5/mapbox/walking/{start[0]},{start[1]};{end[0]},{end[1]}"
-
     r = requests.get(url, params={
         "geometries":"geojson",
         "overview":"full",
         "access_token":MAPBOX_TOKEN
-    })
+    }).json()
 
-    mb = r.json()
-    route = mb["routes"][0]
-    coords = route["geometry"]["coordinates"]
+    if "routes" not in r:
+        return jsonify(r), 500
 
-    active_waypoints = slice_route(coords)
+    route = r["routes"][0]
+    route_geometry = route["geometry"]["coordinates"]
+
+    active_waypoints = slice_route(route_geometry)
     current_index = 0
 
     cmds = generate_commands(active_waypoints)
 
-    print("\n=== NEW ROUTE ===")
-    print(cmds)
+    print("\nNEW ROUTE:", cmds)
 
-    requests.post("http://10.177.21.229:5000/route", json={"commands":cmds})
+    # Send to Pi
+    try:
+        requests.post(PI_URL, json={"commands":cmds}, timeout=2)
+    except:
+        print("Pi not reachable")
 
-    return jsonify({"commands":cmds,"distance":route["distance"],"duration":route["duration"]})
-
-# ================= LIVE GPS FOR MAP =================
-
-@app.route("/gps/live")
-def gps_live():
     return jsonify({
-        "pos": current_gps,
-        "target": active_waypoints[current_index] if active_waypoints and current_index < len(active_waypoints) else None
+        "commands":cmds,
+        "distance":route["distance"],
+        "duration":route["duration"],
+        "geometry":route_geometry
     })
 
-# ================= OBSTACLE =================
+# ================= LIVE =================
 
-@app.route("/obstacle", methods=["POST"])
-def obstacle():
-    global obstacle_detected
-    obstacle_detected = request.json.get("hit", True)
-    print("OBSTACLE:", obstacle_detected)
-    return "ok"
+@app.route("/gps/live")
+def live():
+    return jsonify({
+        "pos": current_gps,
+        "target": active_waypoints[current_index] if current_index < len(active_waypoints) else None
+    })
 
-# ================= GPS MONITOR =================
+# ================= AUTO REROUTER =================
 
 def gps_monitor():
-    global current_index, active_waypoints, current_gps, current_destination, last_reroute, obstacle_detected
+    global current_index, active_waypoints, route_geometry, current_gps, current_destination, last_reroute
 
     while True:
         time.sleep(1)
 
-        if obstacle_detected:
-            print("STOPPED DUE TO OBSTACLE")
+        if not current_gps or not route_geometry:
             continue
 
-        if not current_gps or not active_waypoints:
-            continue
+        # Snap robot to nearest point on route
+        nearest, err = nearest_point_on_route(current_gps, route_geometry)
 
-        if current_index >= len(active_waypoints):
-            continue
+        print("Off route:", round(err,1), "m")
 
-        target = active_waypoints[current_index]
-        error = haversine(current_gps, target)
+        # Snap progress to nearest waypoint
+        if active_waypoints:
+            current_index = min(
+                range(len(active_waypoints)),
+                key=lambda i: haversine(active_waypoints[i], nearest)
+            )
 
-        print("GPS error:", round(error,1),"m")
+        # Only reroute if badly off
+        if err > 12 and current_destination:
+            if time.time() - last_reroute > 8:
+                last_reroute = time.time()
 
-        if error < 3:
-            current_index += 1
-            print("Reached waypoint", current_index)
+                print("REROUTING FROM NEAREST ROUTE POINT")
 
-        elif error > 12 and current_destination:
-            now = time.time()
-            if now - last_reroute > 10:
-                last_reroute = now
-                print("OFF ROUTE — REROUTING")
                 try:
+                    # 🔥 use snapped point, not raw GPS
                     requests.post("http://127.0.0.1:5001/route", json={
-                        "coordinates":[current_gps, current_destination]
-                    })
-                except:
-                    pass
+                        "coordinates":[nearest, current_destination]
+                    }, timeout=2)
+                except Exception as e:
+                    print("Reroute failed:", e)
 
 threading.Thread(target=gps_monitor, daemon=True).start()
 
